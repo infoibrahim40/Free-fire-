@@ -124,19 +124,28 @@ export default function App() {
   const [user, setUser] = React.useState<any>(null);
   const [profile, setProfile] = React.useState<any>(null);
   const [loading, setLoading] = React.useState(true);
-  const [view, setView] = React.useState<'landing' | 'tournaments' | 'dashboard' | 'admin' | 'wallet' | 'referral'>('landing');
+  const [view, setView] = React.useState<'landing' | 'tournaments' | 'dashboard' | 'admin' | 'wallet' | 'referral' | 'tournament-detail'>('landing');
+  const [selectedTournament, setSelectedTournament] = React.useState<any>(null);
   const [isMenuOpen, setIsMenuOpen] = React.useState(false);
+  const [isProfileModalOpen, setIsProfileModalOpen] = React.useState(false);
+  const [isJoinModalOpen, setIsJoinModalOpen] = React.useState(false);
 
   React.useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user ?? null);
-      if (session?.user) fetchProfile(session.user.id);
+      if (session?.user) {
+        fetchProfile(session.user.id);
+        subscribeToProfile(session.user.id);
+      }
       else setLoading(false);
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null);
-      if (session?.user) fetchProfile(session.user.id);
+      if (session?.user) {
+        fetchProfile(session.user.id);
+        subscribeToProfile(session.user.id);
+      }
       else {
         setProfile(null);
         setLoading(false);
@@ -150,6 +159,51 @@ export default function App() {
     const { data, error } = await supabase.from('profiles').select('*').eq('id', uid).single();
     if (data) setProfile(data);
     setLoading(false);
+  };
+
+  const subscribeToProfile = (uid: string) => {
+    const channel = supabase
+      .channel('profile_changes')
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles', filter: `id=eq.${uid}` }, (payload) => {
+        setProfile(payload.new);
+      })
+      .subscribe();
+    return () => supabase.removeChannel(channel);
+  };
+
+  const handleUpdateProfile = async (formData: any) => {
+    if (!user) return;
+    const { error } = await supabase.from('profiles').update(formData).eq('id', user.id);
+    if (!error) {
+      fetchProfile(user.id);
+      setIsProfileModalOpen(false);
+    } else {
+      alert(error.message);
+    }
+  };
+
+  const handleJoinTournament = async (tournamentId: string) => {
+    if (!user) return handleLogin();
+    if (!profile?.ff_uid || !profile?.ign) {
+      alert("Please complete your profile (FF UID and IGN) before joining.");
+      setIsProfileModalOpen(true);
+      return;
+    }
+
+    const { error } = await supabase.from('registrations').insert({
+      tournament_id: tournamentId,
+      player_id: user.id,
+      payment_status: 'pending'
+    });
+
+    if (error) {
+      if (error.code === '23505') alert("You are already registered for this tournament.");
+      else alert(error.message);
+    } else {
+      alert("Registration successful! Please wait for admin approval.");
+      setIsJoinModalOpen(false);
+      setView('dashboard');
+    }
   };
 
   const handleLogin = async () => {
@@ -257,11 +311,47 @@ export default function App() {
       {/* Main Content */}
       <main className="pt-24 pb-12 px-4 max-w-7xl mx-auto">
         {view === 'landing' && <LandingView onExplore={() => setView('tournaments')} onLogin={handleLogin} user={user} />}
-        {view === 'tournaments' && <TournamentsView />}
-        {view === 'dashboard' && <PlayerDashboard profile={profile} />}
+        {view === 'tournaments' && (
+          <TournamentsView 
+            onSelect={(t) => { setSelectedTournament(t); setView('tournament-detail'); }} 
+            onJoin={(t) => { setSelectedTournament(t); setIsJoinModalOpen(true); }}
+          />
+        )}
+        {view === 'tournament-detail' && selectedTournament && (
+          <TournamentDetailView 
+            tournament={selectedTournament} 
+            onBack={() => setView('tournaments')} 
+            onJoin={() => setIsJoinModalOpen(true)}
+          />
+        )}
+        {view === 'dashboard' && <PlayerDashboard profile={profile} onEditProfile={() => setIsProfileModalOpen(true)} />}
         {view === 'admin' && <AdminDashboard />}
         {view === 'wallet' && <WalletView profile={profile} />}
       </main>
+
+      {/* Modals */}
+      <AnimatePresence>
+        {isProfileModalOpen && (
+          <Modal title="Edit Profile" onClose={() => setIsProfileModalOpen(false)}>
+            <ProfileForm profile={profile} onSubmit={handleUpdateProfile} />
+          </Modal>
+        )}
+        {isJoinModalOpen && (
+          <Modal title="Join Tournament" onClose={() => setIsJoinModalOpen(false)}>
+            <div className="space-y-6">
+              <div className="p-4 bg-orange-600/10 border border-orange-600/20 rounded-xl">
+                <p className="text-sm font-bold text-orange-500 uppercase tracking-widest mb-1">Tournament</p>
+                <p className="text-xl font-black uppercase italic">{selectedTournament?.title}</p>
+                <p className="text-sm text-zinc-400 mt-2">Entry Fee: {formatCurrency(selectedTournament?.entry_fee || 0)}</p>
+              </div>
+              <div className="space-y-4">
+                <p className="text-sm text-zinc-400">By joining, you agree to the tournament rules. Your registration will be pending until payment is verified.</p>
+                <Button className="w-full" onClick={() => handleJoinTournament(selectedTournament?.id)}>Confirm Registration</Button>
+              </div>
+            </div>
+          </Modal>
+        )}
+      </AnimatePresence>
 
       {/* Footer */}
       <footer className="border-t border-zinc-900 py-12 px-4">
@@ -388,7 +478,7 @@ function LandingView({ onExplore, onLogin, user }: { onExplore: () => void, onLo
   );
 }
 
-function TournamentsView() {
+function TournamentsView({ onSelect, onJoin }: { onSelect: (t: any) => void, onJoin: (t: any) => void }) {
   const [tournaments, setTournaments] = React.useState<any[]>([]);
   const [loading, setLoading] = React.useState(true);
 
@@ -419,7 +509,7 @@ function TournamentsView() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
         {tournaments.map((t) => (
-          <Card key={t.id} className="group cursor-pointer hover:border-orange-600/50 transition-all">
+          <Card key={t.id} className="group cursor-pointer hover:border-orange-600/50 transition-all" onClick={() => onSelect(t)}>
             <div className="aspect-video relative overflow-hidden">
               <img src={t.banner_url || `https://picsum.photos/seed/${t.id}/800/450`} alt={t.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" referrerPolicy="no-referrer" />
               <div className="absolute top-4 left-4">
@@ -450,7 +540,7 @@ function TournamentsView() {
                   <Zap className="w-4 h-4" />
                   <span className="text-xs font-bold uppercase tracking-widest">{formatDate(t.start_time)}</span>
                 </div>
-                <Button size="sm">Join Now</Button>
+                <Button size="sm" onClick={(e) => { e.stopPropagation(); onJoin(t); }}>Join Now</Button>
               </div>
             </div>
           </Card>
@@ -460,7 +550,7 @@ function TournamentsView() {
   );
 }
 
-function PlayerDashboard({ profile }: { profile: any }) {
+function PlayerDashboard({ profile, onEditProfile }: { profile: any, onEditProfile: () => void }) {
   return (
     <div className="space-y-12">
       <div className="flex flex-col md:flex-row items-center gap-8 p-8 rounded-3xl bg-zinc-900/30 border border-zinc-800">
@@ -476,7 +566,7 @@ function PlayerDashboard({ profile }: { profile: any }) {
           </div>
         </div>
         <div className="flex gap-4">
-          <Button variant="outline">Edit Profile</Button>
+          <Button variant="outline" onClick={onEditProfile}>Edit Profile</Button>
           <Button>Withdraw</Button>
         </div>
       </div>
@@ -579,8 +669,162 @@ function WalletView({ profile }: { profile: any }) {
   );
 }
 
+// --- Additional Components ---
+
+function Modal({ title, children, onClose }: { title: string, children: React.ReactNode, onClose: () => void }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <motion.div
+        initial={{ scale: 0.9, y: 20 }}
+        animate={{ scale: 1, y: 0 }}
+        exit={{ scale: 0.9, y: 20 }}
+        className="bg-zinc-900 border border-zinc-800 rounded-3xl w-full max-w-lg overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-6 border-b border-zinc-800 flex items-center justify-between">
+          <h3 className="text-xl font-black uppercase italic">{title}</h3>
+          <button onClick={onClose} className="text-zinc-500 hover:text-white"><X /></button>
+        </div>
+        <div className="p-6 max-h-[80vh] overflow-y-auto">
+          {children}
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+function ProfileForm({ profile, onSubmit }: { profile: any, onSubmit: (data: any) => void }) {
+  const [formData, setFormData] = React.useState({
+    ign: profile?.ign || '',
+    ff_uid: profile?.ff_uid || '',
+    phone: profile?.phone || '',
+    country: profile?.country || ''
+  });
+
+  return (
+    <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); onSubmit(formData); }}>
+      <div className="space-y-1">
+        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">In-Game Name (IGN)</label>
+        <Input value={formData.ign} onChange={(e) => setFormData({ ...formData, ign: e.target.value })} placeholder="e.g. SKYLORD_FF" required />
+      </div>
+      <div className="space-y-1">
+        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Free Fire UID</label>
+        <Input value={formData.ff_uid} onChange={(e) => setFormData({ ...formData, ff_uid: e.target.value })} placeholder="e.g. 123456789" required />
+      </div>
+      <div className="space-y-1">
+        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Phone Number</label>
+        <Input value={formData.phone} onChange={(e) => setFormData({ ...formData, phone: e.target.value })} placeholder="e.g. +91 9876543210" />
+      </div>
+      <div className="space-y-1">
+        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Country</label>
+        <Input value={formData.country} onChange={(e) => setFormData({ ...formData, country: e.target.value })} placeholder="e.g. India" />
+      </div>
+      <Button type="submit" className="w-full mt-4">Save Profile</Button>
+    </form>
+  );
+}
+
+function TournamentDetailView({ tournament, onBack, onJoin }: { tournament: any, onBack: () => void, onJoin: () => void }) {
+  return (
+    <div className="space-y-12">
+      <button onClick={onBack} className="flex items-center gap-2 text-zinc-500 hover:text-white transition-colors uppercase text-xs font-bold tracking-widest">
+        <X className="w-4 h-4 rotate-45" /> Back to Tournaments
+      </button>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-12">
+        <div className="lg:col-span-2 space-y-8">
+          <div className="aspect-video rounded-3xl overflow-hidden border border-zinc-800">
+            <img src={tournament.banner_url || `https://picsum.photos/seed/${tournament.id}/1200/675`} alt={tournament.title} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+          </div>
+          <div className="space-y-4">
+            <h2 className="text-5xl font-black uppercase italic leading-none">{tournament.title}</h2>
+            <div className="flex flex-wrap gap-4">
+              <Badge variant="success">{tournament.status}</Badge>
+              <Badge>{tournament.type}</Badge>
+              <Badge variant="warning">{formatCurrency(tournament.prize_pool)} Prize Pool</Badge>
+            </div>
+            <p className="text-zinc-400 leading-relaxed text-lg">{tournament.description || 'No description provided.'}</p>
+          </div>
+
+          <div className="space-y-6">
+            <h3 className="text-2xl font-black uppercase italic">Tournament <span className="text-orange-600">Rules</span></h3>
+            <Card className="p-8 prose prose-invert max-w-none">
+              <p className="text-zinc-400 whitespace-pre-wrap">{tournament.rules || 'Standard Free Fire tournament rules apply.'}</p>
+            </Card>
+          </div>
+        </div>
+
+        <div className="space-y-8">
+          <Card className="p-8 space-y-6 border-orange-600/20 bg-gradient-to-br from-zinc-900 to-black">
+            <div className="space-y-4">
+              <div className="flex justify-between items-center">
+                <span className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Entry Fee</span>
+                <span className="text-2xl font-black italic text-orange-500">{formatCurrency(tournament.entry_fee)}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Start Time</span>
+                <span className="text-sm font-bold">{formatDate(tournament.start_time)}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Max Players</span>
+                <span className="text-sm font-bold">{tournament.max_players} / 48</span>
+              </div>
+            </div>
+            <Button size="lg" className="w-full py-6 text-xl rounded-2xl" onClick={onJoin}>Register Now</Button>
+            <p className="text-[10px] text-center text-zinc-600 uppercase font-bold tracking-widest">Secure payment via FireTourney Wallet</p>
+          </Card>
+
+          <div className="space-y-4">
+            <h3 className="text-xl font-black uppercase italic">Prize <span className="text-orange-600">Distribution</span></h3>
+            <Card className="divide-y divide-zinc-800">
+              {[
+                { rank: '1st Place', prize: tournament.prize_pool * 0.5 },
+                { rank: '2nd Place', prize: tournament.prize_pool * 0.25 },
+                { rank: '3rd Place', prize: tournament.prize_pool * 0.15 },
+                { rank: 'Kill Bonus', prize: '+$2 per kill' },
+              ].map((p, i) => (
+                <div key={i} className="p-4 flex justify-between items-center">
+                  <span className="text-sm font-bold uppercase italic">{p.rank}</span>
+                  <span className="font-black text-orange-500">{typeof p.prize === 'number' ? formatCurrency(p.prize) : p.prize}</span>
+                </div>
+              ))}
+            </Card>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AdminDashboard() {
   const [activeTab, setActiveTab] = React.useState<'tournaments' | 'players' | 'results' | 'withdrawals'>('tournaments');
+  const [isCreateModalOpen, setIsCreateModalOpen] = React.useState(false);
+  const [tournaments, setTournaments] = React.useState<any[]>([]);
+
+  const fetchTournaments = async () => {
+    const { data } = await supabase.from('tournaments').select('*').order('created_at', { ascending: false });
+    if (data) setTournaments(data);
+  };
+
+  React.useEffect(() => {
+    fetchTournaments();
+  }, []);
+
+  const handleCreateTournament = async (data: any) => {
+    const { error } = await supabase.from('tournaments').insert(data);
+    if (!error) {
+      fetchTournaments();
+      setIsCreateModalOpen(false);
+    } else {
+      alert(error.message);
+    }
+  };
 
   return (
     <div className="space-y-12">
@@ -606,7 +850,7 @@ function AdminDashboard() {
         <div className="space-y-6">
           <div className="flex justify-between items-center">
             <h3 className="text-2xl font-black uppercase italic">Manage Tournaments</h3>
-            <Button size="sm">+ Create New</Button>
+            <Button size="sm" onClick={() => setIsCreateModalOpen(true)}>+ Create New</Button>
           </div>
           <Card className="overflow-x-auto">
             <table className="w-full text-left">
@@ -615,17 +859,15 @@ function AdminDashboard() {
                   <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Tournament</th>
                   <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Type</th>
                   <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Status</th>
-                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Players</th>
                   <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-800">
-                {[1, 2, 3].map((i) => (
-                  <tr key={i} className="hover:bg-zinc-800/20 transition-colors">
-                    <td className="px-6 py-4 font-bold uppercase italic">Free Fire Pro League S4</td>
-                    <td className="px-6 py-4 text-sm font-bold text-zinc-400 uppercase">Squad</td>
-                    <td className="px-6 py-4"><Badge variant="success">Upcoming</Badge></td>
-                    <td className="px-6 py-4 text-sm font-bold">24 / 48</td>
+                {tournaments.map((t) => (
+                  <tr key={t.id} className="hover:bg-zinc-800/20 transition-colors">
+                    <td className="px-6 py-4 font-bold uppercase italic">{t.title}</td>
+                    <td className="px-6 py-4 text-sm font-bold text-zinc-400 uppercase">{t.type}</td>
+                    <td className="px-6 py-4"><Badge variant={t.status === 'upcoming' ? 'success' : 'warning'}>{t.status}</Badge></td>
                     <td className="px-6 py-4 flex gap-2">
                       <Button variant="outline" size="sm">Edit</Button>
                       <Button variant="secondary" size="sm">Slots</Button>
@@ -638,23 +880,156 @@ function AdminDashboard() {
         </div>
       )}
 
-      {activeTab === 'results' && (
-        <div className="max-w-2xl mx-auto space-y-8">
-          <Card className="p-8 space-y-6 text-center">
-            <div className="w-20 h-20 bg-orange-600/10 rounded-3xl flex items-center justify-center mx-auto border border-orange-600/20">
-              <Zap className="w-10 h-10 text-orange-500" />
-            </div>
-            <div className="space-y-2">
-              <h3 className="text-2xl font-black uppercase italic">AI Result Parser</h3>
-              <p className="text-zinc-500 text-sm">Upload a match result screenshot and our AI will automatically extract kills and placements for all players.</p>
-            </div>
-            <div className="border-2 border-dashed border-zinc-800 rounded-3xl p-12 hover:border-orange-600/50 transition-colors cursor-pointer group">
-              <LayoutDashboard className="w-12 h-12 text-zinc-700 mx-auto mb-4 group-hover:text-orange-500 transition-colors" />
-              <p className="text-sm font-bold text-zinc-500 uppercase tracking-widest">Drop screenshot here or click to upload</p>
-            </div>
-            <Button className="w-full" size="lg">Process Results</Button>
-          </Card>
+      {activeTab === 'results' && <AIResultParser />}
+
+      <AnimatePresence>
+        {isCreateModalOpen && (
+          <Modal title="Create Tournament" onClose={() => setIsCreateModalOpen(false)}>
+            <TournamentForm onSubmit={handleCreateTournament} />
+          </Modal>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function TournamentForm({ onSubmit }: { onSubmit: (data: any) => void }) {
+  const [formData, setFormData] = React.useState({
+    title: '',
+    description: '',
+    type: 'solo',
+    entry_fee: 0,
+    prize_pool: 0,
+    start_time: new Date().toISOString().slice(0, 16),
+    rules: '',
+    max_players: 48
+  });
+
+  return (
+    <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); onSubmit(formData); }}>
+      <div className="space-y-1">
+        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Title</label>
+        <Input value={formData.title} onChange={(e) => setFormData({ ...formData, title: e.target.value })} required />
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-1">
+          <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Type</label>
+          <select 
+            className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-orange-600/50"
+            value={formData.type} 
+            onChange={(e) => setFormData({ ...formData, type: e.target.value })}
+          >
+            <option value="solo">Solo</option>
+            <option value="squad">Squad</option>
+          </select>
         </div>
+        <div className="space-y-1">
+          <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Max Players</label>
+          <Input type="number" value={formData.max_players} onChange={(e) => setFormData({ ...formData, max_players: parseInt(e.target.value) })} />
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-1">
+          <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Entry Fee ($)</label>
+          <Input type="number" value={formData.entry_fee} onChange={(e) => setFormData({ ...formData, entry_fee: parseFloat(e.target.value) })} />
+        </div>
+        <div className="space-y-1">
+          <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Prize Pool ($)</label>
+          <Input type="number" value={formData.prize_pool} onChange={(e) => setFormData({ ...formData, prize_pool: parseFloat(e.target.value) })} />
+        </div>
+      </div>
+      <div className="space-y-1">
+        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Start Time</label>
+        <Input type="datetime-local" value={formData.start_time} onChange={(e) => setFormData({ ...formData, start_time: e.target.value })} required />
+      </div>
+      <div className="space-y-1">
+        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Rules</label>
+        <textarea 
+          className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-orange-600/50 min-h-[100px]"
+          value={formData.rules} 
+          onChange={(e) => setFormData({ ...formData, rules: e.target.value })}
+        />
+      </div>
+      <Button type="submit" className="w-full mt-4">Create Tournament</Button>
+    </form>
+  );
+}
+
+function AIResultParser() {
+  const [isProcessing, setIsProcessing] = React.useState(false);
+  const [results, setResults] = React.useState<any[]>([]);
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsProcessing(true);
+    try {
+      const reader = new FileReader();
+      reader.onloadend = async () => {
+        const base64 = (reader.result as string).split(',')[1];
+        const response = await fetch('/api/ai/parse-results', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ imageBase64: base64 })
+        });
+        const data = await response.json();
+        if (data.results) setResults(data.results);
+        else alert("Failed to parse image.");
+      };
+      reader.readAsDataURL(file);
+    } catch (error) {
+      console.error(error);
+      alert("Error processing image.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-8">
+      <Card className="p-8 space-y-6 text-center">
+        <div className="w-20 h-20 bg-orange-600/10 rounded-3xl flex items-center justify-center mx-auto border border-orange-600/20">
+          <Zap className={cn("w-10 h-10 text-orange-500", isProcessing && "animate-pulse")} />
+        </div>
+        <div className="space-y-2">
+          <h3 className="text-2xl font-black uppercase italic">AI Result Parser</h3>
+          <p className="text-zinc-500 text-sm">Upload a match result screenshot and our AI will automatically extract kills and placements.</p>
+        </div>
+        <label className="block border-2 border-dashed border-zinc-800 rounded-3xl p-12 hover:border-orange-600/50 transition-colors cursor-pointer group">
+          <input type="file" className="hidden" accept="image/*" onChange={handleFileUpload} disabled={isProcessing} />
+          <LayoutDashboard className="w-12 h-12 text-zinc-700 mx-auto mb-4 group-hover:text-orange-500 transition-colors" />
+          <p className="text-sm font-bold text-zinc-500 uppercase tracking-widest">
+            {isProcessing ? 'Processing Image...' : 'Drop screenshot here or click to upload'}
+          </p>
+        </label>
+      </Card>
+
+      {results.length > 0 && (
+        <Card className="overflow-hidden">
+          <div className="p-4 bg-zinc-950 border-b border-zinc-800 flex justify-between items-center">
+            <h4 className="font-black uppercase italic">Parsed Results</h4>
+            <Button size="sm">Save All Results</Button>
+          </div>
+          <table className="w-full text-left">
+            <thead className="bg-zinc-900">
+              <tr>
+                <th className="px-6 py-3 text-[10px] font-black uppercase tracking-widest text-zinc-500">IGN</th>
+                <th className="px-6 py-3 text-[10px] font-black uppercase tracking-widest text-zinc-500">Kills</th>
+                <th className="px-6 py-3 text-[10px] font-black uppercase tracking-widest text-zinc-500">Rank</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-800">
+              {results.map((r, i) => (
+                <tr key={i}>
+                  <td className="px-6 py-3 font-bold uppercase italic text-sm">{r.ign}</td>
+                  <td className="px-6 py-3 font-black text-orange-500">{r.kills}</td>
+                  <td className="px-6 py-3 font-black">{r.placement}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
       )}
     </div>
   );
