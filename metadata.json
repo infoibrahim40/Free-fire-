@@ -1,0 +1,7 @@
+{
+  "name": "FireTourney - Free Fire Tournament Manager",
+  "description": "A production-level Free Fire tournament management platform with automated slot allocation, AI-powered result parsing, and real-time updates.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
