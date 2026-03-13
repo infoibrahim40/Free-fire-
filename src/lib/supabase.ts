@@ -28,8 +28,10 @@ export type Profile = {
   avatar_url: string;
   country: string;
   referral_code: string;
+  referred_by?: string;
   wallet_balance: number;
   role: 'player' | 'admin';
+  created_at: string;
 };
 
 export type Tournament = {
@@ -47,4 +49,46 @@ export type Tournament = {
   room_id?: string;
   room_password?: string;
   kill_points: number;
+  created_at: string;
+  created_by: string;
+};
+
+export type Registration = {
+  id: string;
+  tournament_id: string;
+  player_id: string;
+  squad_id?: string;
+  payment_status: 'pending' | 'approved' | 'rejected';
+  payment_screenshot_url?: string;
+  slot_number?: number;
+  created_at: string;
+};
+
+export type WalletTransaction = {
+  id: string;
+  player_id: string;
+  amount: number;
+  type: 'deposit' | 'withdrawal' | 'winning' | 'referral' | 'entry_fee';
+  status: 'pending' | 'completed' | 'failed';
+  description?: string;
+  created_at: string;
+};
+
+export type WithdrawRequest = {
+  id: string;
+  player_id: string;
+  amount: number;
+  payment_method: string;
+  payment_details: string;
+  status: 'pending' | 'approved' | 'rejected';
+  created_at: string;
+};
+
+export type Notification = {
+  id: string;
+  user_id: string;
+  title: string;
+  message: string;
+  is_read: boolean;
+  created_at: string;
 };

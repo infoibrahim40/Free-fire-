@@ -190,20 +190,53 @@ export default function App() {
       return;
     }
 
-    const { error } = await supabase.from('registrations').insert({
+    const tournament = selectedTournament;
+    if (!tournament) return;
+
+    if (profile.wallet_balance < tournament.entry_fee) {
+      alert("Insufficient balance. Please add funds to your wallet.");
+      setView('wallet');
+      setIsJoinModalOpen(false);
+      return;
+    }
+
+    // Start a transaction-like flow
+    // 1. Deduct balance
+    const newBalance = profile.wallet_balance - tournament.entry_fee;
+    const { error: balanceError } = await supabase.from('profiles').update({ wallet_balance: newBalance }).eq('id', user.id);
+    
+    if (balanceError) {
+      alert("Error processing payment: " + balanceError.message);
+      return;
+    }
+
+    // 2. Create registration
+    const { error: regError } = await supabase.from('registrations').insert({
       tournament_id: tournamentId,
       player_id: user.id,
-      payment_status: 'pending'
+      payment_status: 'approved' // Auto-approved if using wallet balance
     });
 
-    if (error) {
-      if (error.code === '23505') alert("You are already registered for this tournament.");
-      else alert(error.message);
-    } else {
-      alert("Registration successful! Please wait for admin approval.");
-      setIsJoinModalOpen(false);
-      setView('dashboard');
+    if (regError) {
+      // Rollback balance if registration fails
+      await supabase.from('profiles').update({ wallet_balance: profile.wallet_balance }).eq('id', user.id);
+      if (regError.code === '23505') alert("You are already registered for this tournament.");
+      else alert(regError.message);
+      return;
     }
+
+    // 3. Create transaction record
+    await supabase.from('wallet_transactions').insert({
+      player_id: user.id,
+      amount: -tournament.entry_fee,
+      type: 'entry_fee',
+      status: 'completed',
+      description: `Entry fee for ${tournament.title}`
+    });
+
+    alert("Registration successful! You are now joined.");
+    setIsJoinModalOpen(false);
+    setView('dashboard');
   };
 
   const handleLogin = async () => {
@@ -327,6 +360,7 @@ export default function App() {
         {view === 'dashboard' && <PlayerDashboard profile={profile} onEditProfile={() => setIsProfileModalOpen(true)} />}
         {view === 'admin' && <AdminDashboard />}
         {view === 'wallet' && <WalletView profile={profile} />}
+        {view === 'referral' && <ReferralView profile={profile} />}
       </main>
 
       {/* Modals */}
@@ -622,6 +656,85 @@ function PlayerDashboard({ profile, onEditProfile }: { profile: any, onEditProfi
 }
 
 function WalletView({ profile }: { profile: any }) {
+  const [transactions, setTransactions] = React.useState<any[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [isDepositModalOpen, setIsDepositModalOpen] = React.useState(false);
+  const [depositData, setDepositData] = React.useState({ amount: '', method: 'UPI', details: '' });
+
+  const fetchTransactions = async () => {
+    const { data } = await supabase
+      .from('wallet_transactions')
+      .select('*')
+      .eq('player_id', profile.id)
+      .order('created_at', { ascending: false });
+    if (data) setTransactions(data);
+    setLoading(false);
+  };
+
+  React.useEffect(() => {
+    if (profile?.id) fetchTransactions();
+  }, [profile?.id]);
+
+  const handleDepositSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const amount = parseFloat(depositData.amount);
+    if (isNaN(amount) || amount <= 0) return;
+
+    const { error } = await supabase.from('wallet_transactions').insert({
+      player_id: profile.id,
+      amount: amount,
+      type: 'deposit',
+      status: 'pending',
+      description: `Deposit via ${depositData.method}`,
+      payment_proof_url: depositData.details // Using details field for proof for now
+    });
+
+    if (!error) {
+      alert("Deposit request submitted! Admin will verify your payment.");
+      setIsDepositModalOpen(false);
+      fetchTransactions();
+    } else {
+      alert(error.message);
+    }
+  };
+
+  const handleWithdraw = async () => {
+    const amount = prompt("Enter amount to withdraw ($):");
+    if (!amount || isNaN(parseFloat(amount))) return;
+    if (parseFloat(amount) > profile.wallet_balance) {
+      alert("Insufficient balance.");
+      return;
+    }
+
+    const { error } = await supabase.from('withdraw_requests').insert({
+      player_id: profile.id,
+      amount: parseFloat(amount),
+      payment_method: 'UPI/Bank',
+      payment_details: 'User provided details'
+    });
+
+    if (!error) {
+      // Create a pending transaction
+      await supabase.from('wallet_transactions').insert({
+        player_id: profile.id,
+        amount: -parseFloat(amount),
+        type: 'withdrawal',
+        status: 'pending',
+        description: 'Withdrawal request'
+      });
+      
+      // Deduct balance immediately
+      await supabase.from('profiles').update({ 
+        wallet_balance: profile.wallet_balance - parseFloat(amount) 
+      }).eq('id', profile.id);
+
+      alert("Withdrawal request submitted!");
+      fetchTransactions();
+    } else {
+      alert(error.message);
+    }
+  };
+
   return (
     <div className="max-w-4xl mx-auto space-y-12">
       <div className="text-center space-y-4">
@@ -635,36 +748,87 @@ function WalletView({ profile }: { profile: any }) {
           <p className="text-7xl font-black italic text-orange-500">{formatCurrency(profile?.wallet_balance || 0)}</p>
         </div>
         <div className="flex flex-col sm:flex-row gap-4 justify-center">
-          <Button size="lg" className="px-12 rounded-full">Deposit Funds</Button>
-          <Button size="lg" variant="outline" className="px-12 rounded-full">Withdraw Winnings</Button>
+          <Button size="lg" className="px-12 rounded-full" onClick={() => setIsDepositModalOpen(true)}>Deposit Funds</Button>
+          <Button size="lg" variant="outline" className="px-12 rounded-full" onClick={handleWithdraw}>Withdraw Winnings</Button>
         </div>
       </Card>
 
       <div className="space-y-6">
         <h3 className="text-2xl font-black uppercase italic">Transaction <span className="text-orange-600">History</span></h3>
         <Card className="divide-y divide-zinc-800">
-          {[
-            { type: 'winning', amount: 50, desc: 'Tournament Prize - FF Cup', date: new Date().toISOString() },
-            { type: 'entry_fee', amount: -10, desc: 'Entry Fee - Pro League', date: new Date().toISOString() },
-            { type: 'referral', amount: 5, desc: 'Referral Bonus', date: new Date().toISOString() },
-          ].map((tx, i) => (
-            <div key={i} className="p-6 flex items-center justify-between">
-              <div className="flex items-center gap-4">
-                <div className={cn("w-12 h-12 rounded-xl flex items-center justify-center", tx.amount > 0 ? "bg-emerald-900/20 text-emerald-500" : "bg-red-900/20 text-red-500")}>
-                  {tx.amount > 0 ? <Zap className="w-6 h-6" /> : <LogOut className="w-6 h-6 rotate-180" />}
+          {loading ? (
+            <div className="p-8 text-center text-zinc-500 uppercase font-black animate-pulse">Loading Transactions...</div>
+          ) : transactions.length === 0 ? (
+            <div className="p-8 text-center text-zinc-500 uppercase font-black">No transactions yet</div>
+          ) : (
+            transactions.map((tx) => (
+              <div key={tx.id} className="p-6 flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className={cn("w-12 h-12 rounded-xl flex items-center justify-center", tx.amount > 0 ? "bg-emerald-900/20 text-emerald-500" : "bg-red-900/20 text-red-500")}>
+                    {tx.amount > 0 ? <Zap className="w-6 h-6" /> : <LogOut className="w-6 h-6 rotate-180" />}
+                  </div>
+                  <div>
+                    <p className="font-bold uppercase italic">{tx.description || tx.type}</p>
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs text-zinc-500 uppercase tracking-widest">{formatDate(tx.created_at)}</p>
+                      <Badge variant={tx.status === 'completed' ? 'success' : tx.status === 'pending' ? 'warning' : 'danger'}>{tx.status}</Badge>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <p className="font-bold uppercase italic">{tx.desc}</p>
-                  <p className="text-xs text-zinc-500 uppercase tracking-widest">{formatDate(tx.date)}</p>
-                </div>
+                <p className={cn("text-xl font-black italic", tx.amount > 0 ? "text-emerald-500" : "text-red-500")}>
+                  {tx.amount > 0 ? '+' : ''}{formatCurrency(tx.amount)}
+                </p>
               </div>
-              <p className={cn("text-xl font-black italic", tx.amount > 0 ? "text-emerald-500" : "text-red-500")}>
-                {tx.amount > 0 ? '+' : ''}{formatCurrency(tx.amount)}
-              </p>
-            </div>
-          ))}
+            ))
+          )}
         </Card>
       </div>
+
+      <AnimatePresence>
+        {isDepositModalOpen && (
+          <Modal title="Deposit Funds" onClose={() => setIsDepositModalOpen(false)}>
+            <form onSubmit={handleDepositSubmit} className="space-y-4">
+              <div className="p-4 bg-orange-600/10 border border-orange-600/20 rounded-xl space-y-2">
+                <p className="text-xs font-bold uppercase text-orange-500">Payment Details</p>
+                <p className="text-sm font-bold">UPI ID: freefire@upi</p>
+                <p className="text-[10px] text-zinc-500 uppercase">Send payment and enter Transaction ID below</p>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Amount ($)</label>
+                <Input 
+                  type="number" 
+                  value={depositData.amount} 
+                  onChange={(e) => setDepositData({ ...depositData, amount: e.target.value })} 
+                  placeholder="Enter amount"
+                  required 
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Payment Method</label>
+                <select 
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-orange-600/50"
+                  value={depositData.method} 
+                  onChange={(e) => setDepositData({ ...depositData, method: e.target.value })}
+                >
+                  <option value="UPI">UPI</option>
+                  <option value="Bank">Bank Transfer</option>
+                  <option value="Crypto">Crypto</option>
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Transaction ID / Reference</label>
+                <Input 
+                  value={depositData.details} 
+                  onChange={(e) => setDepositData({ ...depositData, details: e.target.value })} 
+                  placeholder="Enter Transaction ID"
+                  required 
+                />
+              </div>
+              <Button type="submit" className="w-full mt-4">Submit Deposit Request</Button>
+            </form>
+          </Modal>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -803,17 +967,48 @@ function TournamentDetailView({ tournament, onBack, onJoin }: { tournament: any,
 }
 
 function AdminDashboard() {
-  const [activeTab, setActiveTab] = React.useState<'tournaments' | 'players' | 'results' | 'withdrawals'>('tournaments');
+  const [activeTab, setActiveTab] = React.useState<'tournaments' | 'registrations' | 'results' | 'withdrawals' | 'deposits'>('tournaments');
   const [isCreateModalOpen, setIsCreateModalOpen] = React.useState(false);
   const [tournaments, setTournaments] = React.useState<any[]>([]);
+  const [registrations, setRegistrations] = React.useState<any[]>([]);
+  const [withdrawals, setWithdrawals] = React.useState<any[]>([]);
+  const [deposits, setDeposits] = React.useState<any[]>([]);
 
   const fetchTournaments = async () => {
     const { data } = await supabase.from('tournaments').select('*').order('created_at', { ascending: false });
     if (data) setTournaments(data);
   };
 
+  const fetchRegistrations = async () => {
+    const { data } = await supabase
+      .from('registrations')
+      .select('*, profiles(full_name, ign, ff_uid), tournaments(title)')
+      .order('created_at', { ascending: false });
+    if (data) setRegistrations(data);
+  };
+
+  const fetchWithdrawals = async () => {
+    const { data } = await supabase
+      .from('withdraw_requests')
+      .select('*, profiles(ign, full_name, wallet_balance)')
+      .order('created_at', { ascending: false });
+    if (data) setWithdrawals(data);
+  };
+
+  const fetchDeposits = async () => {
+    const { data } = await supabase
+      .from('wallet_transactions')
+      .select('*, profiles(ign, full_name, wallet_balance)')
+      .eq('type', 'deposit')
+      .order('created_at', { ascending: false });
+    if (data) setDeposits(data);
+  };
+
   React.useEffect(() => {
     fetchTournaments();
+    fetchRegistrations();
+    fetchWithdrawals();
+    fetchDeposits();
   }, []);
 
   const handleCreateTournament = async (data: any) => {
@@ -826,6 +1021,44 @@ function AdminDashboard() {
     }
   };
 
+  const handleApproveRegistration = async (regId: string, status: 'approved' | 'rejected') => {
+    const { error } = await supabase.from('registrations').update({ payment_status: status }).eq('id', regId);
+    if (!error) fetchRegistrations();
+    else alert(error.message);
+  };
+
+  const handleApproveWithdrawal = async (requestId: string, status: 'approved' | 'rejected') => {
+    const { error } = await supabase.from('withdraw_requests').update({ status }).eq('id', requestId);
+    if (!error) {
+      const request = withdrawals.find(w => w.id === requestId);
+      if (request) {
+        await supabase.from('wallet_transactions')
+          .update({ status: status === 'approved' ? 'completed' : 'failed' })
+          .match({ player_id: request.player_id, type: 'withdrawal', status: 'pending' });
+      }
+      fetchWithdrawals();
+    }
+    else alert(error.message);
+  };
+
+  const handleApproveDeposit = async (txId: string, status: 'completed' | 'failed') => {
+    const { error } = await supabase.from('wallet_transactions').update({ status }).eq('id', txId);
+    if (!error) {
+      const tx = deposits.find(d => d.id === txId);
+      if (status === 'completed' && tx) {
+        // Update user balance
+        const { data: profile } = await supabase.from('profiles').select('wallet_balance').eq('id', tx.player_id).single();
+        if (profile) {
+          await supabase.from('profiles').update({ 
+            wallet_balance: profile.wallet_balance + tx.amount 
+          }).eq('id', tx.player_id);
+        }
+      }
+      fetchDeposits();
+    }
+    else alert(error.message);
+  };
+
   return (
     <div className="space-y-12">
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-6">
@@ -833,12 +1066,12 @@ function AdminDashboard() {
           <h2 className="text-4xl font-black uppercase italic">Admin <span className="text-orange-600">Command Center</span></h2>
           <p className="text-zinc-500 uppercase text-xs font-bold tracking-widest">Manage the battlefield operations</p>
         </div>
-        <div className="flex bg-zinc-900 p-1 rounded-xl border border-zinc-800">
-          {(['tournaments', 'players', 'results', 'withdrawals'] as const).map((tab) => (
+        <div className="flex bg-zinc-900 p-1 rounded-xl border border-zinc-800 overflow-x-auto">
+          {(['tournaments', 'registrations', 'results', 'withdrawals', 'deposits'] as const).map((tab) => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
-              className={cn("px-4 py-2 text-xs font-black uppercase tracking-widest rounded-lg transition-all", activeTab === tab ? "bg-orange-600 text-white shadow-lg" : "text-zinc-500 hover:text-zinc-300")}
+              className={cn("px-4 py-2 text-xs font-black uppercase tracking-widest rounded-lg transition-all whitespace-nowrap", activeTab === tab ? "bg-orange-600 text-white shadow-lg" : "text-zinc-500 hover:text-zinc-300")}
             >
               {tab}
             </button>
@@ -867,10 +1100,124 @@ function AdminDashboard() {
                   <tr key={t.id} className="hover:bg-zinc-800/20 transition-colors">
                     <td className="px-6 py-4 font-bold uppercase italic">{t.title}</td>
                     <td className="px-6 py-4 text-sm font-bold text-zinc-400 uppercase">{t.type}</td>
-                    <td className="px-6 py-4"><Badge variant={t.status === 'upcoming' ? 'success' : 'warning'}>{t.status}</Badge></td>
+                    <td className="px-6 py-4"><Badge variant={t.status === 'upcoming' ? 'success' : t.status === 'ongoing' ? 'warning' : 'default'}>{t.status}</Badge></td>
                     <td className="px-6 py-4 flex gap-2">
                       <Button variant="outline" size="sm">Edit</Button>
                       <Button variant="secondary" size="sm">Slots</Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </Card>
+        </div>
+      )}
+
+      {activeTab === 'registrations' && (
+        <div className="space-y-6">
+          <h3 className="text-2xl font-black uppercase italic">Player Registrations</h3>
+          <Card className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead className="bg-zinc-950 border-b border-zinc-800">
+                <tr>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Player</th>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Tournament</th>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Status</th>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800">
+                {registrations.map((r) => (
+                  <tr key={r.id} className="hover:bg-zinc-800/20 transition-colors">
+                    <td className="px-6 py-4">
+                      <p className="font-bold uppercase italic">{r.profiles?.ign || 'Unknown'}</p>
+                      <p className="text-[10px] text-zinc-500">UID: {r.profiles?.ff_uid}</p>
+                    </td>
+                    <td className="px-6 py-4 text-sm font-bold text-zinc-400 uppercase">{r.tournaments?.title}</td>
+                    <td className="px-6 py-4"><Badge variant={r.payment_status === 'approved' ? 'success' : r.payment_status === 'rejected' ? 'danger' : 'warning'}>{r.payment_status}</Badge></td>
+                    <td className="px-6 py-4 flex gap-2">
+                      {r.payment_status === 'pending' && (
+                        <>
+                          <Button size="sm" onClick={() => handleApproveRegistration(r.id, 'approved')}>Approve</Button>
+                          <Button variant="danger" size="sm" onClick={() => handleApproveRegistration(r.id, 'rejected')}>Reject</Button>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </Card>
+        </div>
+      )}
+
+      {activeTab === 'withdrawals' && (
+        <div className="space-y-6">
+          <h3 className="text-2xl font-black uppercase italic">Withdrawal Requests</h3>
+          <Card className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead className="bg-zinc-950 border-b border-zinc-800">
+                <tr>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Player</th>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Amount</th>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Status</th>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800">
+                {withdrawals.map((w) => (
+                  <tr key={w.id} className="hover:bg-zinc-800/20 transition-colors">
+                    <td className="px-6 py-4">
+                      <p className="font-bold uppercase italic">{w.profiles?.ign || 'Unknown'}</p>
+                      <p className="text-[10px] text-zinc-500">{w.payment_method}: {w.payment_details}</p>
+                    </td>
+                    <td className="px-6 py-4 font-black text-orange-500">{formatCurrency(w.amount)}</td>
+                    <td className="px-6 py-4"><Badge variant={w.status === 'approved' ? 'success' : w.status === 'rejected' ? 'danger' : 'warning'}>{w.status}</Badge></td>
+                    <td className="px-6 py-4 flex gap-2">
+                      {w.status === 'pending' && (
+                        <>
+                          <Button size="sm" onClick={() => handleApproveWithdrawal(w.id, 'approved')}>Approve</Button>
+                          <Button variant="danger" size="sm" onClick={() => handleApproveWithdrawal(w.id, 'rejected')}>Reject</Button>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </Card>
+        </div>
+      )}
+
+      {activeTab === 'deposits' && (
+        <div className="space-y-6">
+          <h3 className="text-2xl font-black uppercase italic">Deposit Requests</h3>
+          <Card className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead className="bg-zinc-950 border-b border-zinc-800">
+                <tr>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Player</th>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Amount</th>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Status</th>
+                  <th className="px-6 py-4 text-xs font-black uppercase tracking-widest text-zinc-500">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800">
+                {deposits.map((d) => (
+                  <tr key={d.id} className="hover:bg-zinc-800/20 transition-colors">
+                    <td className="px-6 py-4">
+                      <p className="font-bold uppercase italic">{d.profiles?.ign || 'Unknown'}</p>
+                      <p className="text-[10px] text-zinc-500">Ref: {d.payment_proof_url}</p>
+                    </td>
+                    <td className="px-6 py-4 font-black text-emerald-500">{formatCurrency(d.amount)}</td>
+                    <td className="px-6 py-4"><Badge variant={d.status === 'completed' ? 'success' : d.status === 'failed' ? 'danger' : 'warning'}>{d.status}</Badge></td>
+                    <td className="px-6 py-4 flex gap-2">
+                      {d.status === 'pending' && (
+                        <>
+                          <Button size="sm" onClick={() => handleApproveDeposit(d.id, 'completed')}>Approve</Button>
+                          <Button variant="danger" size="sm" onClick={() => handleApproveDeposit(d.id, 'failed')}>Reject</Button>
+                        </>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -889,6 +1236,104 @@ function AdminDashboard() {
           </Modal>
         )}
       </AnimatePresence>
+    </div>
+  );
+}
+
+function ReferralView({ profile }: { profile: any }) {
+  const [referrals, setReferrals] = React.useState<any[]>([]);
+  const [loading, setLoading] = React.useState(true);
+
+  const fetchReferrals = async () => {
+    const { data } = await supabase
+      .from('profiles')
+      .select('ign, created_at')
+      .eq('referred_by', profile.id);
+    if (data) setReferrals(data);
+    setLoading(false);
+  };
+
+  React.useEffect(() => {
+    if (profile?.id) fetchReferrals();
+  }, [profile?.id]);
+
+  const referralLink = `${window.location.origin}?ref=${profile?.id}`;
+
+  const copyToClipboard = () => {
+    navigator.clipboard.writeText(referralLink);
+    alert("Referral link copied!");
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-12">
+      <div className="text-center space-y-4">
+        <h2 className="text-5xl font-black uppercase italic">Refer & <span className="text-orange-600">Earn</span></h2>
+        <p className="text-zinc-500 uppercase text-xs font-bold tracking-widest">Build your squad and get rewarded</p>
+      </div>
+
+      <div className="grid md:grid-cols-2 gap-8">
+        <Card className="p-8 space-y-6 bg-zinc-900/80 border-orange-600/20">
+          <div className="w-16 h-16 bg-orange-600/20 rounded-2xl flex items-center justify-center border border-orange-600/30">
+            <Gift className="w-8 h-8 text-orange-500" />
+          </div>
+          <div className="space-y-2">
+            <h3 className="text-2xl font-black uppercase italic">Invite Friends</h3>
+            <p className="text-zinc-400 text-sm">Share your unique referral link with your friends. When they join and play their first tournament, you both get a bonus!</p>
+          </div>
+          <div className="space-y-4">
+            <div className="p-4 bg-black rounded-xl border border-zinc-800 font-mono text-sm break-all">
+              {referralLink}
+            </div>
+            <Button className="w-full" onClick={copyToClipboard}>Copy Link</Button>
+          </div>
+        </Card>
+
+        <Card className="p-8 space-y-6 bg-zinc-900/80 border-orange-600/20">
+          <div className="w-16 h-16 bg-emerald-600/20 rounded-2xl flex items-center justify-center border border-emerald-600/30">
+            <Zap className="w-8 h-8 text-emerald-500" />
+          </div>
+          <div className="space-y-2">
+            <h3 className="text-2xl font-black uppercase italic">Your Stats</h3>
+            <p className="text-zinc-400 text-sm">Track your referral progress and earnings.</p>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="p-4 bg-black rounded-xl border border-zinc-800 text-center">
+              <p className="text-2xl font-black italic text-orange-500">{referrals.length}</p>
+              <p className="text-[10px] font-bold uppercase text-zinc-500 tracking-widest">Total Referrals</p>
+            </div>
+            <div className="p-4 bg-black rounded-xl border border-zinc-800 text-center">
+              <p className="text-2xl font-black italic text-emerald-500">{formatCurrency(referrals.length * 5)}</p>
+              <p className="text-[10px] font-bold uppercase text-zinc-500 tracking-widest">Total Earned</p>
+            </div>
+          </div>
+        </Card>
+      </div>
+
+      <div className="space-y-6">
+        <h3 className="text-2xl font-black uppercase italic">Recent <span className="text-orange-600">Referrals</span></h3>
+        <Card className="divide-y divide-zinc-800">
+          {loading ? (
+            <div className="p-8 text-center text-zinc-500 uppercase font-black animate-pulse">Loading Referrals...</div>
+          ) : referrals.length === 0 ? (
+            <div className="p-8 text-center text-zinc-500 uppercase font-black">No referrals yet</div>
+          ) : (
+            referrals.map((ref, i) => (
+              <div key={i} className="p-6 flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="w-10 h-10 rounded-full bg-zinc-800 flex items-center justify-center font-bold text-orange-500">
+                    {ref.ign?.[0] || '?'}
+                  </div>
+                  <div>
+                    <p className="font-bold uppercase italic">{ref.ign || 'New Player'}</p>
+                    <p className="text-xs text-zinc-500 uppercase tracking-widest">Joined {formatDate(ref.created_at)}</p>
+                  </div>
+                </div>
+                <Badge variant="success">Active</Badge>
+              </div>
+            ))
+          )}
+        </Card>
+      </div>
     </div>
   );
 }

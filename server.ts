@@ -1,50 +1,75 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
-import { GoogleGenAI } from "@google/genai";
+import { fileURLToPath } from "url";
+import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '50mb' }));
 
   // AI Result Parsing Endpoint
   app.post("/api/ai/parse-results", async (req, res) => {
     try {
       const { imageBase64 } = req.body;
-      if (!imageBase64) return res.status(400).json({ error: "Image data required" });
+      if (!imageBase64) {
+        return res.status(400).json({ error: "No image provided" });
+      }
 
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-      const model = ai.models.generateContent({
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        return res.status(500).json({ error: "Gemini API key not configured" });
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
+      
+      const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: [
           {
             parts: [
-              { text: "Extract Free Fire match results from this image. Return a JSON array of objects with 'ign' (In-Game Name), 'kills', and 'placement' (rank). Only return the JSON." },
-              { inlineData: { mimeType: "image/png", data: imageBase64 } }
-            ]
-          }
-        ]
+              {
+                inlineData: {
+                  mimeType: "image/png",
+                  data: imageBase64,
+                },
+              },
+              {
+                text: "Extract Free Fire match results from this screenshot. Return a JSON array of objects with 'rank', 'ign', and 'kills'. Only return the JSON.",
+              },
+            ],
+          },
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                rank: { type: Type.NUMBER },
+                ign: { type: Type.STRING },
+                kills: { type: Type.NUMBER },
+              },
+              required: ["rank", "ign", "kills"],
+            },
+          },
+        },
       });
 
-      const response = await model;
-      const text = response.text;
-      
-      // Basic JSON extraction
-      const jsonMatch = text.match(/\[.*\]/s);
-      if (jsonMatch) {
-        const results = JSON.parse(jsonMatch[0]);
-        res.json({ results });
-      } else {
-        res.status(500).json({ error: "Could not parse AI response", raw: text });
-      }
-    } catch (error) {
+      const results = JSON.parse(response.text || "[]");
+      res.json(results);
+    } catch (error: any) {
       console.error("AI Parsing Error:", error);
-      res.status(500).json({ error: "Internal server error" });
+      res.status(500).json({ error: error.message });
     }
   });
 
